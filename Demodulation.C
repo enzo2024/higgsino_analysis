@@ -8,11 +8,41 @@
 #include <TF1.h>
 #include <ROOT/RVec.hxx>
 #include <TGraph2D.h>
+#include <numeric>
+#include <math.h>
+template <typename S>
+ostream& operator<<(ostream& os,
+                    const vector<S>& vector) {
+  
+    // Printing all the elements using <<
+    for (auto i : vector) 
+        os << i << ", ";
+    // Printing a new line at the end
+    os << endl;
+    return os;
+}
+
+double avg(std::vector<double> vec) {
+    double sum = 0.0;
+    for (const auto& i : vec) {
+        sum += i;
+    }
+    return sum / vec.size();
+}
+
+double dev(std::vector<double> vec) {
+    double mean = avg(vec);
+    double sum = 0.0;
+    for (const auto& i : vec) {
+        sum += (i - mean) * (i - mean);
+    }
+    return sqrt(sum / (vec.size() - 1)); // sample standard deviation
+}
 
 //this function is used for weighting based on time
 double sin2weight(ULong64_t time) {
     double omega = (2 * TMath::Pi()) / (3600*23 + 56*60 + 4); //angular frequency of sidereal day
-    double time_double = (double)time;
+    double time_double = (double)((time - 1594676438368)/ 1000); //time shift array here
     double phase = 0;
     return (1 - TMath::Cos(2 * omega * (time_double - phase))) / 2; //equivalent to sin squared weighting
 }
@@ -50,63 +80,124 @@ void Demodulation() {
     auto filtered2 = ex.Filter("AnalysisBaseCut && GoodForAnalysis && PCACut && Multiplicity == 1 && NumberOfPulses == 1");
     auto withSin2Weights2 = filtered2.Define("Sin2Weighting", sin2weight, {"EventTime"});
 
-    auto timeArr = withSin2Weights2.Take<ULong64_t>("EventTime");
+    auto timeArr = withSin2Weights2.Take<ULong64_t>("EventTime"); //not time adjusted yet
     auto energyArr = withSin2Weights2.Take<double>("Energy");
     auto weightArr = withSin2Weights2.Take<double>("Sin2Weighting");
 
+    double startTime = (*timeArr)[0];
+    double last = ((*timeArr)[timeArr->size() - 1] - startTime) / 1000;
+    double energyLow = 1300;
+    double energyHigh = 1500;
+
     //weighting by sin squared function
-    auto g2d = new TGraph2D(timeArr->size());
-    for (int i = 0; i < timeArr->size(); i++) {
-        g2d->SetPoint(i, (*timeArr)[i], (*energyArr)[i], (*weightArr)[i]);
-    }
-    g2d->GetYaxis()->SetRangeUser(1280, 1530);
-    g2d->GetXaxis()->SetTitleOffset(2.5);
-    g2d->GetYaxis()->SetTitleOffset(2);
-    g2d->SetTitle("Energy Weighted vs Time (Summer 2020);Unix Time (ms);Energy (keV);Sin Squared Weighting");
-    g2d->SetMarkerStyle(8); //changes from default square to large dot
-    g2d->SetMarkerSize(0.4);
-    g2d->Draw("PCOL0"); // plot markers with color, no stats box
-
-    c->SaveAs("energyScatter.pdf");
-
-
-    //use integral to extract phase and amp
-    g2d->GetYaxis()->SetRangeUser(1459, 1461); //redefine to narrow gap instead
-    int total = timeArr->size();
-    int nEvents = 0;
-    double *validEnergies = g2d->GetY();
-    //counts number of events
-    for (int i = 0; i < g2d->GetN(); ++i) {
-        if (validEnergies[i] >= 1459 && validEnergies[i] <= 1461) {
-            nEvents++;
+    int totalArrLen = timeArr->size();
+    auto g2d = new TGraph2D(totalArrLen);
+    for (int i = 0; i < totalArrLen; i++) {
+        if (energyLow < (*energyArr)[i] && (*energyArr)[i] < energyHigh) {
+            //Take method returns pointer, so dereference first
+            double fixTime = ((*timeArr)[i] - startTime) / 1000;
+            g2d->SetPoint(i, fixTime, (*energyArr)[i], (*weightArr)[i]); //reminder! og time array still not adjusted
         }
     }
-    auto inPhase = new TF1("f1", cosDemod, (*timeArr)[0], (*timeArr)[timeArr->size() - 1]);
-    auto quadrature = new TF1("f2", sinDemod, (*timeArr)[0], (*timeArr)[timeArr->size() - 1]);
+    g2d->Draw("PCOL0"); // plot markers with color, no stats box
+    g2d->GetYaxis()->SetRangeUser(1320, 1480); 
+    //slightly less than energyLow and High to avoid fXmax error
+    g2d->GetXaxis()->SetTitleOffset(2.5);
+    g2d->GetYaxis()->SetTitleOffset(2);
+    g2d->SetTitle("Energy Weighted vs Time (Summer 2020); Adjusted Time (s);Energy (keV);Sin Squared Weighting");
+    g2d->SetMarkerStyle(8); //changes from default square to large dot
+    g2d->SetMarkerSize(0.4);
 
-    Double_t allowedErr = 0.;
-    Double_t *err = &allowedErr;
-    auto integ = inPhase->IntegralOneDim((*timeArr)[0], (*timeArr)[timeArr->size() - 1], 1.E-3, 1.E-3, *err); //1.E-3 is relaxed tolerance
-    auto integ2 = quadrature->IntegralOneDim((*timeArr)[0], (*timeArr)[timeArr->size() - 1], 1.E-3, 1.E-3, *err);
-    double iqPhase = TMath::ATan2(nEvents * integ2, nEvents * integ); 
+    c->Update();
+    c->SaveAs("energyScatter.pdf");
+
+    //extract phase and amp
+    std::vector<double> eventArr; //dynamically sized std::vector arrays
+    std::vector<double> nrgArr;
+    std::vector<double> inPhaseArr;
+    std::vector<double> quadArr;
+
+    int siderealDay = 3600*23 + 56*60 + 4;
+    int currTime = 0;
+    int endTime = 0;
+    while (endTime < last) {
+        endTime += siderealDay;
+        int nEvents = 0;
+        std::vector<double> nrgAvg;
+        // for (int i = currTime; i < endTime; i++) { //figures stuff out for each sidereal period
+            
+            /* this is all test code */
+            for (int i = 0; i < totalArrLen; i++) {
+                if ((1459 <= (*energyArr)[i] && (*energyArr)[i] <= 1461)  && (currTime <= (((*timeArr)[i] - startTime) / 1000) && (((*timeArr)[i] - startTime) / 1000) < endTime )) {
+            /* up until here */
+                
+            //if (1459 <= (*energyArr)[i] && (*energyArr)[i] <= 1461) { //if energy at time 0 is valid then add
+                nEvents++;
+                nrgAvg.push_back((*energyArr)[i]); //adds it to dynamic sized array
+                }
+            }
+        // }
+	if(nEvents == 0){continue;}
+        eventArr.push_back(nEvents);
+        double avgNrg = std::accumulate(nrgAvg.begin(), nrgAvg.end(), 0.0) / nrgAvg.size(); //should be 1460 ish
+
+        if (!TMath::IsNaN(avgNrg)) {
+            nrgArr.push_back(avgNrg);
+        }
+
+        Double_t allowedErr = 5.;
+        Double_t *err = &allowedErr;
+        //creates TF1 object from [0] to [total]
+        auto inPhase = new TF1("f1", cosDemod, 0, last); //time still not adjusted
+        double integVal = inPhase->Integral(currTime, endTime, 1.E-6); //relative error
+        inPhaseArr.push_back(integVal);
+
+        auto quadrature = new TF1("f2", sinDemod, 0, last);
+        double integVal2 = quadrature->Integral(currTime, endTime, 1.E-6);
+        quadArr.push_back(integVal2);
+
+        currTime = endTime; //move other pointer forward
+    }
+    std::cout << (eventArr) << std::endl;
+    std::cout << (inPhaseArr) << std::endl;
+    std::cout << (quadArr) << std::endl;
+    int totalROI = std::accumulate(eventArr.begin(), eventArr.end(), 0.0);
+    int totalROIper = totalROI / eventArr.size(); //total per sidereal period
+
+    double integRes = (std::accumulate(inPhaseArr.begin(), inPhaseArr.end(), 0.0)) / (double) inPhaseArr.size(); //(double) inPhaseArr.size()
+    double integRes2 = (std::accumulate(quadArr.begin(), quadArr.end(), 0.0)) / (double) quadArr.size();
+    //didn't average here and time shift problems
+
+    std::vector<double> iqPhase, amplitude;
+    for (int i = 0; i < eventArr.size(); i++) {
+        iqPhase.push_back(TMath::ATan2(quadArr[i], inPhaseArr[i]));
+        amplitude.push_back(TMath::Hypot(eventArr[i] * quadArr[i], eventArr[i] * inPhaseArr[i])); 
+    }
     //arctan will cancel out constants leaving only phase
-    double amplitude = TMath::Hypot(nEvents * integ, nEvents * integ2);
+    // double amplitude = TMath::Hypot(totalROIper * integRes, totalROIper * integRes2);
 
-    std::cout << "\n\nThe total number of events in Jul-Aug 2020 dataset is: " << total << std::endl;
-    std::cout << "The number of events in the energy range [1459, 1461] is: " << nEvents << std::endl;
-    std::cout << "\nThe phase is: " << iqPhase << std::endl;
-    std::cout << "The amplitude is: " << amplitude << "\n" << std::endl;
+    double avgEnerg = (std::accumulate(nrgArr.begin(), nrgArr.end(), 0.0)) / nrgArr.size(); 
+    /*
+    for every small sidereal duration, count number of events and average energy, use that for your
+    integral to find inPhase and quadrature amounts for specific duration,
+    */
 
-    
-    //try snapshot to a temporary ROOT file with custom columns
-    auto snapshot = withSin2Weights2.Snapshot("tempTree", "temp_snapshot.root", {"Energy", "EventTime", "Sin2Weighting"});
-    TFile snap("temp_snapshot.root");
-    auto tree = (TTree*)snap.Get("tempTree");
-    //workaround to draw scatterplot with Draw() by not using RDataFrame
+    std::cout << "\n\nThe total number of events in Jul-Aug 2020 dataset is: " << totalArrLen << std::endl;
+    std::cout << "The total number of events in the energy range [1459, 1461] is: " << totalROI << std::endl;
+    std::cout << "The average number of events in range per sidereal day is: " << totalROIper << std::endl;
+    // std::cout << "The variance in the average number of events is: " << std::fixed << std::setprecision(25) << Variance(eventArr) << std::endl; 
 
-    auto d = new TCanvas();
+    std::cout << "\nThe average phase is: " << std::fixed << std::setprecision(25)<< std::scientific << avg(iqPhase) << std::endl;
+    std::cout << "The standard deviation of the phase is: " << std::fixed << std::setprecision(25) << std::scientific << dev(iqPhase) << "\n" << std::endl;
 
-    tree->Draw("Energy:EventTime", "Sin2Weighting"); 
+    // std::cout << "The variance of the phase is: " << std::fixed << std::setprecision(25) << Variance(TMath::ATan2(quadArr, inPhaseArr)) << std::endl; //phase variance
+    std::cout << "The average amplitude is: " << std::fixed << std::setprecision(25) <<std::scientific << avg(amplitude) << std::endl;
+    std::cout << "The standard deviation of the amplitude is: " << std::fixed << std::setprecision(25) << std::scientific << dev(amplitude) << "\n" << std::endl;
 
-    d->SaveAs("2dscatter.pdf");
+    std::cout << "The average energy in the range is: " << std::fixed << std::setprecision(25) << avgEnerg << std::endl;
+    double siderealdaycount = last / siderealDay;
+    std::cout << "There are " << siderealdaycount << " sidereal days in this dataset" << std::endl;
+   
+    double solardaycount = (last / (3600*24));
+    std::cout << "There are " << solardaycount << " solar days in this dataset\n\n" << std::endl;
 }
